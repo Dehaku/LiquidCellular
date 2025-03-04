@@ -215,6 +215,11 @@ namespace LiquidSystem
             liquidComputeShader.SetInt("ChunkSize", chunkSize);
             liquidComputeShader.SetBuffer(calculatePressureKernelId, "NeighborsBuffer", neighborsBuffer);
             
+            // Create dummy buffer for non-existent chunks
+            ComputeBuffer dummyBuffer = new ComputeBuffer(1, sizeof(uint));
+            uint[] dummyData = new uint[1] { 0 };
+            dummyBuffer.SetData(dummyData);
+            
             // Set up adjacent chunk buffers if available
             ComputeBuffer[] adjacentBuffers = new ComputeBuffer[6];
             for (int i = 0; i < 6; i++)
@@ -222,14 +227,21 @@ namespace LiquidSystem
                 if (chunk.AdjacentChunks[i] != null)
                 {
                     adjacentBuffers[i] = chunk.AdjacentChunks[i].GetComputeBuffer();
-                    liquidComputeShader.SetBuffer(calculatePressureKernelId, "AdjacentChunk" + i, adjacentBuffers[i]);
                     liquidComputeShader.SetInt("HasAdjacentChunk" + i, 1);
                 }
                 else
                 {
+                    adjacentBuffers[i] = dummyBuffer;
                     liquidComputeShader.SetInt("HasAdjacentChunk" + i, 0);
                 }
+                
+                // Set buffer for all kernels
+                liquidComputeShader.SetBuffer(calculatePressureKernelId, "AdjacentChunk" + i, adjacentBuffers[i]);
+                liquidComputeShader.SetBuffer(simulateLiquidFlowKernelId, "AdjacentChunk" + i, adjacentBuffers[i]);
+                liquidComputeShader.SetBuffer(handleLiquidInteractionsKernelId, "AdjacentChunk" + i, adjacentBuffers[i]);
             }
+            
+            // We'll release the dummy buffer after dispatch
             
             // Execute pressure calculation
             liquidComputeShader.Dispatch(calculatePressureKernelId, 
@@ -253,6 +265,10 @@ namespace LiquidSystem
             
             // Set buffers for liquid interactions
             liquidComputeShader.SetBuffer(handleLiquidInteractionsKernelId, "CellBuffer", cellBuffer);
+            liquidComputeShader.SetBuffer(handleLiquidInteractionsKernelId, "NeighborsBuffer", neighborsBuffer);
+            
+            // Set chunk parameters for the interactions kernel
+            liquidComputeShader.SetInt("ChunkSize", chunkSize);
             
             // Execute liquid interactions
             liquidComputeShader.Dispatch(handleLiquidInteractionsKernelId, 
@@ -262,6 +278,9 @@ namespace LiquidSystem
             
             // Update chunk data from compute buffer
             chunk.UpdateFromComputeBuffer(cellBuffer);
+            
+            // Release the dummy buffer
+            dummyBuffer.Release();
         }
         
         // Public API methods for modifying liquid system
