@@ -1,0 +1,522 @@
+#pragma kernel CalculatePressure
+#pragma kernel SimulateLiquidFlow
+#pragma kernel HandleLiquidInteractions
+
+// Liquid cell data structure (packed into a single uint)
+struct LiquidCellData
+{
+    uint packedData;
+};
+
+// Constants
+#define MAX_LIQUID_AMOUNT 12
+#define LIQUID_TYPE_NONE 0
+#define LIQUID_TYPE_WATER 1
+#define LIQUID_TYPE_OIL 2 
+#define LIQUID_TYPE_LAVA 3
+#define WALL_TYPE_NONE 0
+#define WALL_TYPE_DIRT 1
+#define WALL_TYPE_STONE 2
+
+// Buffers
+RWStructuredBuffer<LiquidCellData> CellBuffer;
+StructuredBuffer<int3> NeighborsBuffer;
+
+// Adjacent chunk buffers (may be null)
+RWStructuredBuffer<LiquidCellData> AdjacentChunk0; // +X
+RWStructuredBuffer<LiquidCellData> AdjacentChunk1; // -X
+RWStructuredBuffer<LiquidCellData> AdjacentChunk2; // +Y
+RWStructuredBuffer<LiquidCellData> AdjacentChunk3; // -Y
+RWStructuredBuffer<LiquidCellData> AdjacentChunk4; // +Z
+RWStructuredBuffer<LiquidCellData> AdjacentChunk5; // -Z
+
+// Flags for adjacent chunks
+int HasAdjacentChunk0;
+int HasAdjacentChunk1;
+int HasAdjacentChunk2;
+int HasAdjacentChunk3;
+int HasAdjacentChunk4;
+int HasAdjacentChunk5;
+
+// Parameters
+int ChunkSize;
+float LiquidDensities[4]; // Density for each liquid type
+float LiquidFlowRates[4]; // Flow rate for each liquid type
+
+// Utility functions for packing/unpacking cell data
+uint GetLiquidType(LiquidCellData cell)
+{
+    return cell.packedData & 0xFF;
+}
+
+uint GetLiquidAmount(LiquidCellData cell)
+{
+    return (cell.packedData >> 8) & 0xFF;
+}
+
+uint GetWallType(LiquidCellData cell)
+{
+    return (cell.packedData >> 16) & 0xFF;
+}
+
+float GetPressure(LiquidCellData cell)
+{
+    return float((cell.packedData >> 24) & 0xFF) / 255.0f;
+}
+
+LiquidCellData SetLiquidType(LiquidCellData cell, uint liquidType)
+{
+    cell.packedData = (cell.packedData & 0xFFFFFF00) | (liquidType & 0xFF);
+    return cell;
+}
+
+LiquidCellData SetLiquidAmount(LiquidCellData cell, uint liquidAmount)
+{
+    cell.packedData = (cell.packedData & 0xFFFF00FF) | ((liquidAmount & 0xFF) << 8);
+    return cell;
+}
+
+LiquidCellData SetWallType(LiquidCellData cell, uint wallType)
+{
+    cell.packedData = (cell.packedData & 0xFF00FFFF) | ((wallType & 0xFF) << 16);
+    return cell;
+}
+
+LiquidCellData SetPressure(LiquidCellData cell, float pressure)
+{
+    uint pressureFixed = uint(clamp(pressure, 0.0f, 1.0f) * 255.0f);
+    cell.packedData = (cell.packedData & 0x00FFFFFF) | (pressureFixed << 24);
+    return cell;
+}
+
+// Helper function to get cell index from 3D position
+int GetCellIndex(int3 pos)
+{
+    // Make sure position is within bounds
+    pos = clamp(pos, int3(0, 0, 0), int3(ChunkSize - 1, ChunkSize - 1, ChunkSize - 1));
+    return pos.x + pos.y * ChunkSize + pos.z * ChunkSize * ChunkSize;
+}
+
+// Helper function to get adjacent cell, handling chunk boundaries
+LiquidCellData GetAdjacentCell(int3 pos, int3 neighbor)
+{
+    int3 newPos = pos + neighbor;
+    
+    // Check if position is outside current chunk
+    if (newPos.x < 0)
+    {
+        if (HasAdjacentChunk1)
+        {
+            int3 adjPos = int3(ChunkSize - 1, newPos.y, newPos.z);
+            return AdjacentChunk1[GetCellIndex(adjPos)];
+        }
+    }
+    else if (newPos.x >= ChunkSize)
+    {
+        if (HasAdjacentChunk0)
+        {
+            int3 adjPos = int3(0, newPos.y, newPos.z);
+            return AdjacentChunk0[GetCellIndex(adjPos)];
+        }
+    }
+    else if (newPos.y < 0)
+    {
+        if (HasAdjacentChunk3)
+        {
+            int3 adjPos = int3(newPos.x, ChunkSize - 1, newPos.z);
+            return AdjacentChunk3[GetCellIndex(adjPos)];
+        }
+    }
+    else if (newPos.y >= ChunkSize)
+    {
+        if (HasAdjacentChunk2)
+        {
+            int3 adjPos = int3(newPos.x, 0, newPos.z);
+            return AdjacentChunk2[GetCellIndex(adjPos)];
+        }
+    }
+    else if (newPos.z < 0)
+    {
+        if (HasAdjacentChunk5)
+        {
+            int3 adjPos = int3(newPos.x, newPos.y, ChunkSize - 1);
+            return AdjacentChunk5[GetCellIndex(adjPos)];
+        }
+    }
+    else if (newPos.z >= ChunkSize)
+    {
+        if (HasAdjacentChunk4)
+        {
+            int3 adjPos = int3(newPos.x, newPos.y, 0);
+            return AdjacentChunk4[GetCellIndex(adjPos)];
+        }
+    }
+    else
+    {
+        // Position is within current chunk
+        return CellBuffer[GetCellIndex(newPos)];
+    }
+    
+    // Default empty cell if no adjacent chunk
+    LiquidCellData emptyCell;
+    emptyCell.packedData = 0;
+    return emptyCell;
+}
+
+// Helper function to check if a cell has liquid
+bool HasLiquid(LiquidCellData cell)
+{
+    return GetLiquidType(cell) != LIQUID_TYPE_NONE && GetLiquidAmount(cell) > 0;
+}
+
+// Helper function to check if a cell has a wall
+bool HasWall(LiquidCellData cell)
+{
+    return GetWallType(cell) != WALL_TYPE_NONE;
+}
+
+// Calculate pressure for each cell based on gravity, height, and liquid amount
+[numthreads(8,8,8)]
+void CalculatePressure(uint3 id : SV_DispatchThreadID)
+{
+    // Check if position is within bounds
+    if (id.x >= (uint)ChunkSize || id.y >= (uint)ChunkSize || id.z >= (uint)ChunkSize)
+        return;
+    
+    // Get cell index
+    int index = GetCellIndex(id);
+    LiquidCellData cell = CellBuffer[index];
+    
+    // Skip cells with no liquid or with walls
+    if (!HasLiquid(cell) || HasWall(cell))
+    {
+        // Reset pressure to 0
+        CellBuffer[index] = SetPressure(cell, 0.0f);
+        return;
+    }
+    
+    // Calculate pressure based on:
+    // 1. Height (y position) - higher cells have less pressure
+    // 2. Liquid amount - more liquid means more pressure
+    // 3. Liquid density - denser liquids exert more pressure
+    
+    float liquidAmount = float(GetLiquidAmount(cell)) / float(MAX_LIQUID_AMOUNT);
+    float liquidDensity = LiquidDensities[GetLiquidType(cell)];
+    
+    // Base pressure is determined by liquid amount and density
+    float basePressure = liquidAmount * liquidDensity;
+    
+    // Gravity factor: pressure increases as y decreases
+    float gravityFactor = 1.0f - (float(id.y) / float(ChunkSize));
+    
+    // Calculate pressure
+    float pressure = basePressure * (1.0f + gravityFactor);
+    
+    // Clamp pressure to [0,1] range
+    pressure = clamp(pressure, 0.0f, 1.0f);
+    
+    // Update cell pressure
+    CellBuffer[index] = SetPressure(cell, pressure);
+}
+
+// Simulate liquid flow between cells based on pressure
+[numthreads(8,8,8)]
+void SimulateLiquidFlow(uint3 id : SV_DispatchThreadID)
+{
+    // Check if position is within bounds
+    if (id.x >= (uint)ChunkSize || id.y >= (uint)ChunkSize || id.z >= (uint)ChunkSize)
+        return;
+    
+    // Get cell index
+    int index = GetCellIndex(id);
+    LiquidCellData cell = CellBuffer[index];
+    
+    // Skip cells with no liquid or with walls
+    if (!HasLiquid(cell) || HasWall(cell))
+        return;
+    
+    uint liquidType = GetLiquidType(cell);
+    uint liquidAmount = GetLiquidAmount(cell);
+    float flowRate = LiquidFlowRates[liquidType];
+    float pressure = GetPressure(cell);
+    
+    // If cell is empty or has negligible liquid, skip
+    if (liquidAmount == 0)
+        return;
+    
+    // Store original liquid amount to track changes
+    uint originalAmount = liquidAmount;
+    
+    // Check each of the 6 neighboring cells
+    for (int i = 0; i < 6; i++)
+    {
+        int3 neighbor = NeighborsBuffer[i];
+        LiquidCellData neighborCell = GetAdjacentCell(id, neighbor);
+        
+        // Skip if neighbor has a wall
+        if (HasWall(neighborCell))
+            continue;
+        
+        // Calculate pressure difference
+        float pressureDiff = pressure - GetPressure(neighborCell);
+        
+        // Only flow if pressure is higher in current cell
+        if (pressureDiff > 0.0f)
+        {
+            // Calculate flow amount based on pressure difference and flow rate
+            uint flowAmount = min(liquidAmount, uint(pressureDiff * flowRate * liquidAmount));
+            
+            // Ensure minimum flow of 1 if there's any flow
+            if (flowAmount > 0)
+            {
+                // Reduce liquid in current cell
+                liquidAmount -= flowAmount;
+                
+                // Directly update the neighbor cell (simplified for compute shader)
+                // In a real implementation, you'd accumulate these changes and apply them in a separate pass
+                uint neighborLiquidType = GetLiquidType(neighborCell);
+                uint neighborLiquidAmount = GetLiquidAmount(neighborCell);
+                
+                // If neighbor is empty, just add liquid
+                if (neighborLiquidType == LIQUID_TYPE_NONE || neighborLiquidAmount == 0)
+                {
+                    neighborCell = SetLiquidType(neighborCell, liquidType);
+                    neighborCell = SetLiquidAmount(neighborCell, flowAmount);
+                }
+                // If neighbor has same liquid type, add to amount
+                else if (neighborLiquidType == liquidType)
+                {
+                    neighborLiquidAmount = min(MAX_LIQUID_AMOUNT, neighborLiquidAmount + flowAmount);
+                    neighborCell = SetLiquidAmount(neighborCell, neighborLiquidAmount);
+                }
+                // If neighbor has different liquid, use simplified mixing
+                else
+                {
+                    // For now, liquid with higher amount wins
+                    if (flowAmount > neighborLiquidAmount)
+                    {
+                        neighborCell = SetLiquidType(neighborCell, liquidType);
+                        neighborCell = SetLiquidAmount(neighborCell, flowAmount);
+                    }
+                    // If equal amounts, weighted by density
+                    else if (flowAmount == neighborLiquidAmount)
+                    {
+                        float currentDensity = LiquidDensities[liquidType];
+                        float neighborDensity = LiquidDensities[neighborLiquidType];
+                        
+                        // Liquid with higher density wins
+                        if (currentDensity > neighborDensity)
+                        {
+                            neighborCell = SetLiquidType(neighborCell, liquidType);
+                            neighborCell = SetLiquidAmount(neighborCell, flowAmount);
+                        }
+                        // Otherwise keep neighbor's type but increase amount
+                        else
+                        {
+                            neighborCell = SetLiquidAmount(neighborCell, neighborLiquidAmount + flowAmount);
+                        }
+                    }
+                    // Otherwise keep neighbor's liquid type but increase amount
+                    else
+                    {
+                        neighborLiquidAmount = min(MAX_LIQUID_AMOUNT, neighborLiquidAmount + flowAmount);
+                        neighborCell = SetLiquidAmount(neighborCell, neighborLiquidAmount);
+                    }
+                }
+                
+                // Write changes back to appropriate buffer
+                int3 newPos = id + neighbor;
+                
+                if (newPos.x < 0 && HasAdjacentChunk1)
+                {
+                    int3 adjPos = int3(ChunkSize - 1, newPos.y, newPos.z);
+                    AdjacentChunk1[GetCellIndex(adjPos)] = neighborCell;
+                }
+                else if (newPos.x >= ChunkSize && HasAdjacentChunk0)
+                {
+                    int3 adjPos = int3(0, newPos.y, newPos.z);
+                    AdjacentChunk0[GetCellIndex(adjPos)] = neighborCell;
+                }
+                else if (newPos.y < 0 && HasAdjacentChunk3)
+                {
+                    int3 adjPos = int3(newPos.x, ChunkSize - 1, newPos.z);
+                    AdjacentChunk3[GetCellIndex(adjPos)] = neighborCell;
+                }
+                else if (newPos.y >= ChunkSize && HasAdjacentChunk2)
+                {
+                    int3 adjPos = int3(newPos.x, 0, newPos.z);
+                    AdjacentChunk2[GetCellIndex(adjPos)] = neighborCell;
+                }
+                else if (newPos.z < 0 && HasAdjacentChunk5)
+                {
+                    int3 adjPos = int3(newPos.x, newPos.y, ChunkSize - 1);
+                    AdjacentChunk5[GetCellIndex(adjPos)] = neighborCell;
+                }
+                else if (newPos.z >= ChunkSize && HasAdjacentChunk4)
+                {
+                    int3 adjPos = int3(newPos.x, newPos.y, 0);
+                    AdjacentChunk4[GetCellIndex(adjPos)] = neighborCell;
+                }
+                else if (newPos.x >= 0 && newPos.x < ChunkSize && 
+                         newPos.y >= 0 && newPos.y < ChunkSize && 
+                         newPos.z >= 0 && newPos.z < ChunkSize)
+                {
+                    CellBuffer[GetCellIndex(newPos)] = neighborCell;
+                }
+            }
+        }
+        
+        // Stop if all liquid has been distributed
+        if (liquidAmount == 0)
+            break;
+    }
+    
+    // Update cell liquid amount if changed
+    if (liquidAmount != originalAmount)
+    {
+        cell = SetLiquidAmount(cell, liquidAmount);
+        
+        // If no liquid left, reset liquid type
+        if (liquidAmount == 0)
+        {
+            cell = SetLiquidType(cell, LIQUID_TYPE_NONE);
+        }
+        
+        CellBuffer[index] = cell;
+    }
+}
+
+// Handle special interactions between different liquid types
+[numthreads(8,8,8)]
+void HandleLiquidInteractions(uint3 id : SV_DispatchThreadID)
+{
+    // Check if position is within bounds
+    if (id.x >= (uint)ChunkSize || id.y >= (uint)ChunkSize || id.z >= (uint)ChunkSize)
+        return;
+    
+    // Get cell index
+    int index = GetCellIndex(id);
+    LiquidCellData cell = CellBuffer[index];
+    
+    // Skip cells with no liquid or with walls
+    if (!HasLiquid(cell) || HasWall(cell))
+        return;
+    
+    uint liquidType = GetLiquidType(cell);
+    
+    // Check all neighbors for interactions
+    for (int i = 0; i < 6; i++)
+    {
+        int3 neighbor = NeighborsBuffer[i];
+        int3 neighborPos = id + neighbor;
+        
+        // Skip out-of-bounds neighbors
+        if (neighborPos.x < 0 || neighborPos.x >= ChunkSize ||
+            neighborPos.y < 0 || neighborPos.y >= ChunkSize ||
+            neighborPos.z < 0 || neighborPos.z >= ChunkSize)
+            continue;
+        
+        int neighborIndex = GetCellIndex(neighborPos);
+        LiquidCellData neighborCell = CellBuffer[neighborIndex];
+        
+        // Skip cells with no liquid or with walls
+        if (!HasLiquid(neighborCell) || HasWall(neighborCell))
+            continue;
+        
+        uint neighborLiquidType = GetLiquidType(neighborCell);
+        
+        // Skip if same liquid type
+        if (liquidType == neighborLiquidType)
+            continue;
+        
+        // Handle special interactions
+        
+        // 1. Lava + Water = Stone (simplified)
+        if ((liquidType == LIQUID_TYPE_LAVA && neighborLiquidType == LIQUID_TYPE_WATER) ||
+            (liquidType == LIQUID_TYPE_WATER && neighborLiquidType == LIQUID_TYPE_LAVA))
+        {
+            // Create stone in the water cell
+            if (liquidType == LIQUID_TYPE_WATER)
+            {
+                // Convert water to stone
+                cell = SetLiquidType(cell, LIQUID_TYPE_NONE);
+                cell = SetLiquidAmount(cell, 0);
+                cell = SetWallType(cell, WALL_TYPE_STONE);
+                CellBuffer[index] = cell;
+                
+                // Reduce lava amount
+                uint lavaAmount = GetLiquidAmount(neighborCell);
+                lavaAmount = max(0, lavaAmount - 1);
+                
+                if (lavaAmount == 0)
+                {
+                    neighborCell = SetLiquidType(neighborCell, LIQUID_TYPE_NONE);
+                }
+                
+                neighborCell = SetLiquidAmount(neighborCell, lavaAmount);
+                CellBuffer[neighborIndex] = neighborCell;
+            }
+            else // liquidType == LIQUID_TYPE_LAVA
+            {
+                // Convert neighbor water to stone
+                neighborCell = SetLiquidType(neighborCell, LIQUID_TYPE_NONE);
+                neighborCell = SetLiquidAmount(neighborCell, 0);
+                neighborCell = SetWallType(neighborCell, WALL_TYPE_STONE);
+                CellBuffer[neighborIndex] = neighborCell;
+                
+                // Reduce lava amount
+                uint lavaAmount = GetLiquidAmount(cell);
+                lavaAmount = max(0, lavaAmount - 1);
+                
+                if (lavaAmount == 0)
+                {
+                    cell = SetLiquidType(cell, LIQUID_TYPE_NONE);
+                }
+                
+                cell = SetLiquidAmount(cell, lavaAmount);
+                CellBuffer[index] = cell;
+            }
+            
+            // Only process one interaction per cell per update
+            return;
+        }
+        
+        // 2. Oil + Lava = Fire (oil gets consumed)
+        if ((liquidType == LIQUID_TYPE_OIL && neighborLiquidType == LIQUID_TYPE_LAVA) ||
+            (liquidType == LIQUID_TYPE_LAVA && neighborLiquidType == LIQUID_TYPE_OIL))
+        {
+            // Consume oil (simplified)
+            if (liquidType == LIQUID_TYPE_OIL)
+            {
+                // Reduce oil amount
+                uint oilAmount = GetLiquidAmount(cell);
+                oilAmount = max(0, oilAmount - 1);
+                
+                if (oilAmount == 0)
+                {
+                    cell = SetLiquidType(cell, LIQUID_TYPE_NONE);
+                }
+                
+                cell = SetLiquidAmount(cell, oilAmount);
+                CellBuffer[index] = cell;
+            }
+            else // liquidType == LIQUID_TYPE_LAVA
+            {
+                // Reduce neighbor oil amount
+                uint oilAmount = GetLiquidAmount(neighborCell);
+                oilAmount = max(0, oilAmount - 1);
+                
+                if (oilAmount == 0)
+                {
+                    neighborCell = SetLiquidType(neighborCell, LIQUID_TYPE_NONE);
+                }
+                
+                neighborCell = SetLiquidAmount(neighborCell, oilAmount);
+                CellBuffer[neighborIndex] = neighborCell;
+            }
+            
+            // Only process one interaction per cell per update
+            return;
+        }
+    }
+}
